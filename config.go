@@ -61,15 +61,17 @@ type Config struct {
 			// (defaults to true). You should only set this to false if you're using
 			// a non-Kafka SASL proxy.
 			Handshake bool
-			//username and password for SASL/PLAIN authentication
+			//username and password for SASL/PLAIN authentication or SASL/CRAM authentication
 			User     string
 			Password string
+
+			// (optional) authorization ID for SASL/CRAM authentication
+			AuthorizationID string
 			// TokenProvider is a user-defined callback for generating
 			// access tokens for SASL/OAUTHBEARER auth. See the
 			// AccessTokenProvider interface docs for proper implementation
 			// guidelines.
 			TokenProvider AccessTokenProvider
-			SCRAMClient   SCRAMClient
 		}
 
 		// KeepAlive specifies the keep-alive period for an active network connection.
@@ -476,6 +478,13 @@ func (c *Config) Validate() error {
 		} else if c.Net.SASL.Mechanism == SASLTypeOAuth {
 			if c.Net.SASL.TokenProvider == nil {
 				return ConfigurationError("An AccessTokenProvider instance must be provided to Net.SASL.User.TokenProvider")
+			}
+		} else if c.Net.SASL.Mechanism == SASLTypeCRAM {
+			if c.Net.SASL.User == "" {
+				return ConfigurationError("Net.SASL.User must not be empty when SASL is enabled")
+			}
+			if c.Net.SASL.Password == "" {
+				return ConfigurationError("Net.SASL.Password must not be empty when SASL is enabled")
 			}
 		} else {
 			msg := fmt.Sprintf("The SASL mechanism configuration is invalid. Possible values are `%s` and `%s`",
