@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,8 +54,8 @@ type Broker struct {
 type SASLMechanism string
 
 const (
-	// SASLTypeCRAM represents the SASL/CRAM mechanism (Kafka 2.0.0+)
-	SASLTypeCRAM = "CRAM"
+	// SASLTypeSCRAM represents the SASL/CRAM mechanism (Kafka 2.0.0+)
+	SASLTypeSCRAM = "SCRAM"
 	// SASLTypeOAuth represents the SASL/OAUTHBEARER mechanism (Kafka 2.0.0+)
 	SASLTypeOAuth = "OAUTHBEARER"
 	// SASLTypePlaintext represents the SASL/PLAIN mechanism
@@ -64,17 +66,34 @@ const (
 	// SASLHandshakeV1 is v1 of the Kafka SASL handshake protocol. Client and
 	// server negotiate SASL by wrapping tokens with Kafka protocol headers.
 	SASLHandshakeV1 = int16(1)
+	// SASLExtKeyAuth is the reserved extension key name sent as part of the
+	// SASL/OAUTHBEARER intial client response
+	SASLExtKeyAuth = "auth"
 )
+
+// AccessToken contains an access token used to authenticate a
+// SASL/OAUTHBEARER client along with associated metadata.
+type AccessToken struct {
+	// Token is the access token payload.
+	Token string
+	// Extensions is a optional map of arbitrary key-value pairs that can be
+	// sent with the SASL/OAUTHBEARER initial client response. These values are
+	// ignored by the SASL server if they are unexpected. This feature is only
+	// supported by Kafka >= 2.1.0.
+	Extensions map[string]string
+}
 
 // AccessTokenProvider is the interface that encapsulates how implementors
 // can generate access tokens for Kafka broker authentication.
 type AccessTokenProvider interface {
-	// Token returns an access token. Because this method may be called multiple
-	// times, each invocation returns a new, unexpired token. This method should
-	// not block indefinitely. A timeout error should be returned after a short
-	// period of inactivity so that the broker connection logic can log
-	// debugging information and retry.
-	Token() (string, error)
+	// Token returns an access token. The implementation should ensure token
+	// reuse so that multiple calls at connect time do not create multiple
+	// tokens. The implementation should also periodically refresh the token in
+	// order to guarantee that each call returns an unexpired token.  This
+	// method should not block indefinitely--a timeout error should be returned
+	// after a short period of inactivity so that the broker connection logic
+	// can log debugging information and retry.
+	Token() (*AccessToken, error)
 }
 
 type responsePromise struct {
@@ -157,16 +176,7 @@ func (b *Broker) Open(conf *Config) error {
 
 		if conf.Net.SASL.Enable {
 
-			switch conf.Net.SASL.Mechanism {
-			case SASLTypeOAuth:
-				b.connErr = b.sendAndReceiveSASLOAuth(conf.Net.SASL.TokenProvider)
-			case SASLTypeCRAM:
-				b.connErr = b.sendAndReceiveSASLCRAM()
-			case SASLTypePlaintext:
-				b.connErr = b.sendAndReceiveSASLPlainAuth()
-			default:
-				b.connErr = b.sendAndReceiveSASLPlainAuth()
-			}
+			b.connErr = b.authenticateViaSASL()
 
 			if b.connErr != nil {
 				err = b.conn.Close()
@@ -786,6 +796,13 @@ func (b *Broker) responseReceiver() {
 	close(b.done)
 }
 
+func (b *Broker) authenticateViaSASL() error {
+	if b.conf.Net.SASL.Mechanism == SASLTypeOAuth {
+		return b.sendAndReceiveSASLOAuth(b.conf.Net.SASL.TokenProvider)
+	}
+	return b.sendAndReceiveSASLPlainAuth()
+}
+
 func (b *Broker) sendAndReceiveSASLHandshake(saslType string, version int16) error {
 	rb := &SaslHandshakeRequest{Mechanism: saslType, Version: version}
 
@@ -898,13 +915,13 @@ func (b *Broker) sendAndReceiveSASLPlainAuth() error {
 
 // sendAndReceiveSASLOAuth performs the authentication flow as described by KIP-255
 // https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=75968876
-func (b *Broker) sendAndReceiveSASLOAuth(tokenProvider AccessTokenProvider) error {
+func (b *Broker) sendAndReceiveSASLOAuth(provider AccessTokenProvider) error {
 
 	if err := b.sendAndReceiveSASLHandshake(SASLTypeOAuth, SASLHandshakeV1); err != nil {
 		return err
 	}
 
-	token, err := tokenProvider.Token()
+	token, err := provider.Token()
 
 	if err != nil {
 		return err
@@ -919,8 +936,6 @@ func (b *Broker) sendAndReceiveSASLOAuth(tokenProvider AccessTokenProvider) erro
 	if err != nil {
 		return err
 	}
-
-	Logger.Printf("Correlation ID %d ", b.correlationID)
 
 	b.updateOutgoingCommunicationMetrics(bytesWritten)
 
@@ -938,13 +953,48 @@ func (b *Broker) sendAndReceiveSASLOAuth(tokenProvider AccessTokenProvider) erro
 	return nil
 }
 
-func (b *Broker) sendSASLOAuthBearerClientResponse(bearerToken string, correlationID int32) (int, error) {
+// Build SASL/OAUTHBEARER initial client response as described by RFC-7628
+// https://tools.ietf.org/html/rfc7628
+func buildClientInitialResponse(token *AccessToken) ([]byte, error) {
 
-	// Initial client response as described by RFC-7628
-	// https://tools.ietf.org/html/rfc7628
-	oauthRequest := []byte(fmt.Sprintf("n,,\x01auth=Bearer %s\x01\x01", bearerToken))
+	var ext string
 
-	rb := &SaslAuthenticateRequest{oauthRequest}
+	if token.Extensions != nil && len(token.Extensions) > 0 {
+		if _, ok := token.Extensions[SASLExtKeyAuth]; ok {
+			return []byte{}, fmt.Errorf("The extension `%s` is invalid", SASLExtKeyAuth)
+		}
+		ext = "\x01" + mapToString(token.Extensions, "=", "\x01")
+	}
+
+	resp := []byte(fmt.Sprintf("n,,\x01auth=Bearer %s%s\x01\x01", token.Token, ext))
+
+	return resp, nil
+}
+
+// mapToString returns a list of key-value pairs ordered by key.
+// keyValSep separates the key from the value. elemSep separates each pair.
+func mapToString(extensions map[string]string, keyValSep string, elemSep string) string {
+
+	buf := make([]string, 0, len(extensions))
+
+	for k, v := range extensions {
+		buf = append(buf, k+keyValSep+v)
+	}
+
+	sort.Strings(buf)
+
+	return strings.Join(buf, elemSep)
+}
+
+func (b *Broker) sendSASLOAuthBearerClientResponse(token *AccessToken, correlationID int32) (int, error) {
+
+	initialResp, err := buildClientInitialResponse(token)
+
+	if err != nil {
+		return 0, err
+	}
+
+	rb := &SaslAuthenticateRequest{initialResp}
 
 	req := &request{correlationID: correlationID, clientID: b.conf.ClientID, body: rb}
 
@@ -958,13 +1008,7 @@ func (b *Broker) sendSASLOAuthBearerClientResponse(bearerToken string, correlati
 		return 0, err
 	}
 
-	bytesWritten, err := b.conn.Write(buf)
-
-	if err != nil {
-		return 0, err
-	}
-
-	return bytesWritten, nil
+	return b.conn.Write(buf)
 }
 
 func (b *Broker) receiveSASLOAuthBearerServerResponse(correlationID int32) (int, error) {
