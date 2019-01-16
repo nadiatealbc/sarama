@@ -13,7 +13,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/rcrowley/go-metrics"
 	"github.com/xdg/scram"
 )
@@ -797,9 +796,15 @@ func (b *Broker) responseReceiver() {
 }
 
 func (b *Broker) authenticateViaSASL() error {
-	if b.conf.Net.SASL.Mechanism == SASLTypeOAuth {
+	switch b.conf.Net.SASL.Mechanism {
+	case SASLTypeOAuth:
 		return b.sendAndReceiveSASLOAuth(b.conf.Net.SASL.TokenProvider)
+	case SASLTypeSCRAM:
+		return b.sendAndReceiveSASLSCRAM()
+	default:
+		return b.sendAndReceiveSASLPlainAuth()
 	}
+
 	return b.sendAndReceiveSASLPlainAuth()
 }
 
@@ -1030,7 +1035,7 @@ func (b *Broker) receiveSASLOAuthBearerServerResponse(correlationID int32) (int,
 	}
 
 	if header.correlationID != correlationID {
-		return bytesRead, errors.Errorf("correlation ID didn't match, wanted %d, got %d", b.correlationID, header.correlationID)
+		return bytesRead, fmt.Errorf("correlation ID didn't match, wanted %d, got %d", b.correlationID, header.correlationID)
 	}
 
 	buf = make([]byte, header.length-4)
@@ -1049,14 +1054,22 @@ func (b *Broker) receiveSASLOAuthBearerServerResponse(correlationID int32) (int,
 		return bytesRead, err
 	}
 
+	if err != nil {
+		return bytesRead, err
+	}
+
 	if res.Err != ErrNoError {
 		return bytesRead, res.Err
+	}
+
+	if len(res.SaslAuthBytes) > 0 {
+		Logger.Printf("Received SASL auth response: %s", res.SaslAuthBytes)
 	}
 
 	return bytesRead, nil
 }
 
-func (b *Broker) sendAndReceiveSASLCRAM() error {
+func (b *Broker) sendAndReceiveSASLSCRAM() error {
 
 	if err := b.sendAndReceiveSASLHandshake(SASLTypeSCRAM, SASLHandshakeV1); err != nil {
 		return err
