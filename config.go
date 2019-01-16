@@ -69,6 +69,7 @@ type Config struct {
 			// AccessTokenProvider interface docs for proper implementation
 			// guidelines.
 			TokenProvider AccessTokenProvider
+			SCRAMClient   SCRAMClient
 		}
 
 		// KeepAlive specifies the keep-alive period for an active network connection.

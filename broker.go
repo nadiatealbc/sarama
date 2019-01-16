@@ -3,6 +3,7 @@ package sarama
 import (
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -56,6 +57,9 @@ const (
 	SASLTypeOAuth = "OAUTHBEARER"
 	// SASLTypePlaintext represents the SASL/PLAIN mechanism
 	SASLTypePlaintext = "PLAIN"
+	// SASLTypeSCRAM represents the SCRAM-SHA-X mechanisms family: e.g. SCRAM-SHA-1
+	// SCRAM-SHA-256
+	SASLTypeSCRAM = "SCRAM"
 	// SASLHandshakeV0 is v0 of the Kafka SASL handshake protocol. Client and
 	// server negotiate SASL auth using opaque packets.
 	SASLHandshakeV0 = int16(0)
@@ -90,6 +94,20 @@ type AccessTokenProvider interface {
 	// after a short period of inactivity so that the broker connection logic
 	// can log debugging information and retry.
 	Token() (*AccessToken, error)
+}
+
+// SCRAMClient is a an interface to a SCRAM
+// client implementation.
+type SCRAMClient interface {
+	// Begin prepares the client for the SCRAM exchange
+	// with the server with a user name and a password
+	Begin(userName, password string) error
+	// Step steps client through the SCRAM exchange. It is
+	// called repeatedly until it errs or `Done` returns true.
+	Step(challenge string) (response string, err error)
+	// Done Should return true when the SCRAM conversation
+	// is over.
+	Done() bool
 }
 
 type responsePromise struct {
@@ -793,10 +811,15 @@ func (b *Broker) responseReceiver() {
 }
 
 func (b *Broker) authenticateViaSASL() error {
-	if b.conf.Net.SASL.Mechanism == SASLTypeOAuth {
+	switch b.conf.Net.SASL.Mechanism {
+	case SASLTypeOAuth:
 		return b.sendAndReceiveSASLOAuth(b.conf.Net.SASL.TokenProvider)
+	case SASLTypeSCRAM:
+		return b.sendAndReceiveSASLSCRAM(b.conf.Net.SASL.SCRAMClient)
+	default:
+		return b.sendAndReceiveSASLPlainAuth()
 	}
-	return b.sendAndReceiveSASLPlainAuth()
+
 }
 
 func (b *Broker) sendAndReceiveSASLHandshake(saslType string, version int16) error {
@@ -947,6 +970,14 @@ func (b *Broker) sendAndReceiveSASLOAuth(provider AccessTokenProvider) error {
 	b.updateIncomingCommunicationMetrics(bytesRead, requestLatency)
 
 	return nil
+}
+
+func (b *Broker) sendAndReceiveSASLSCRAM(client SCRAMClient) error {
+
+	if err := b.sendAndReceiveSASLHandshake(SASLTypeSCRAM, SASLHandshakeV1); err != nil {
+		return err
+	}
+	return errors.New("SASL SCRAM is not implemented")
 }
 
 // Build SASL/OAUTHBEARER initial client response as described by RFC-7628
